@@ -291,8 +291,6 @@ class Layer {
     param_propagate_down_[param_id] = value;
   }
 
-
- protected:
   /** The protobuf that stores the layer parameters */
   LayerParameter layer_param_;
   /** The phase: TRAIN or TEST */

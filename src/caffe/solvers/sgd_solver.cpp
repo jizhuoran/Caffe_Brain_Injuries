@@ -5,6 +5,11 @@
 #include "caffe/util/hdf5.hpp"
 #include "caffe/util/io.hpp"
 #include "caffe/util/upgrade_proto.hpp"
+#include "caffe/dkm/dkm.hpp"
+
+#define CLUSTERING_ITR 10000
+#define ZH_GRAD_RATE 2
+#define ZH_COMPRESSION_RATE 20
 
 namespace caffe {
 
@@ -105,6 +110,14 @@ void SGDSolver<Dtype>::ApplyUpdate() {
     LOG_IF(INFO, Caffe::root_solver()) << "Iteration " << this->iter_
         << ", lr = " << rate;
   }
+
+
+  // if (this->param_.display() && this->iter_ % 1000 == 0 && this->iter_) {
+		// LOG_IF(INFO, Caffe::root_solver()) << "Iteration " << this->iter_
+		//     << ", lr = " << rate << "And the zhihan error is " << zhihan_error();
+  // }
+  
+  
   ClipGradients();
   for (int param_id = 0; param_id < this->net_->learnable_params().size();
        ++param_id) {
@@ -114,6 +127,179 @@ void SGDSolver<Dtype>::ApplyUpdate() {
   }
   this->net_->Update();
 }
+
+template<typename Dtype>
+void SGDSolver<Dtype>::zh_clustering() {
+  Dtype zh_learning_rate = GetLearningRate() * ZH_GRAD_RATE;
+  
+  int prev_injuries = 0;
+
+  for (auto layer_tmp : this->net_->layers()) {
+
+    Dtype injuries_rate = 0; // = std::max((45000 - this->iter_)/60000.0, 0.0);
+    
+    
+    if (!strcmp(layer_tmp->type(), "Convolution")) { //it is convolution layer
+      Dtype* weights_ = layer_tmp->blobs_[0]->mutable_gpu_data();
+      Dtype* bias_    = layer_tmp->blobs_[1]->mutable_gpu_data();
+
+      Dtype* dweights_ = layer_tmp->blobs_[0]->mutable_gpu_diff();
+      Dtype* dbias_    = layer_tmp->blobs_[1]->mutable_gpu_diff();
+
+
+
+
+      //Dtype injuries_rate = 0;
+
+      int injuries_part = (layer_tmp->blobs_[0]->shape(0) / 32) * ZH_COMPRESSION_RATE;
+      int another_part = layer_tmp->blobs_[0]->shape(0) - injuries_part;
+
+
+      caffe_gpu_scal(layer_tmp->blobs_[0]->count(1) * injuries_part, injuries_rate, weights_);
+      caffe_gpu_scal(layer_tmp->blobs_[0]->count(1) * injuries_part, injuries_rate, dweights_);
+      
+      for(int i = injuries_part; i <layer_tmp->blobs_[0]->shape(0); ++i) {
+        caffe_gpu_scal(layer_tmp->blobs_[0]->count(2) * prev_injuries, injuries_rate, weights_+layer_tmp->blobs_[0]->count(1)*i);
+        caffe_gpu_scal(layer_tmp->blobs_[0]->count(2) * prev_injuries, injuries_rate, dweights_+layer_tmp->blobs_[0]->count(1)*i);
+      }
+
+      caffe_gpu_scal(injuries_part, injuries_rate, bias_);
+      caffe_gpu_scal(injuries_part, injuries_rate, dbias_);
+
+      prev_injuries = injuries_part;
+      
+      
+    }
+
+    
+    
+    if (!strcmp(layer_tmp->type(), "InnerProduct")) {
+
+      Dtype* weights_ = layer_tmp->blobs_[0]->mutable_gpu_data();
+      Dtype* dweights_ = layer_tmp->blobs_[0]->mutable_gpu_diff();
+
+      int injuries_part = (layer_tmp->blobs_[0]->shape(1) / 32) * ZH_COMPRESSION_RATE;
+
+
+      for(int i = 0; i < layer_tmp->blobs_[0]->shape(0); ++i) {
+        caffe_gpu_scal(injuries_part, injuries_rate, weights_+layer_tmp->blobs_[0]->count(1)*i);
+        caffe_gpu_scal(injuries_part, injuries_rate, dweights_+layer_tmp->blobs_[0]->count(1)*i);
+
+      }
+
+    }
+  
+
+  }
+}
+
+
+
+
+template<typename Dtype>
+Dtype SGDSolver<Dtype>::zhihan_error() {
+  
+  Dtype error = 0.0;
+  
+  for (int i = 0; i < this->net_->layers().size(); ++i) {
+    auto layer_tmp = this->net_->layers()[i];
+    auto watch_this = layer_tmp->type();
+    if (!strcmp(layer_tmp->type(), "Convolution")) { //it is convolution layer
+      const Dtype* params_ = layer_tmp->blobs_[0]->cpu_data();
+      int filter_size = (layer_tmp->blobs_[0]->shape(2) *layer_tmp->blobs_[0]->shape(3));
+      int num_filter = layer_tmp->blobs_[0]->count() / filter_size;
+      int in_channel = layer_tmp->blobs_[0]->shape(1);
+      int out_channel = layer_tmp->blobs_[0]->shape(0);
+    
+    
+      if (filter_size == 25) {
+        std::vector<std::vector<std::array<Dtype, 25>> > filter_data(in_channel);
+        for (int j = 0; j < in_channel; ++j) {
+          filter_data[j] = std::vector<std::array<Dtype, 25> >(out_channel); //= new Dtype*[out_channel];
+
+        }
+    
+        for (int j = 0; j < out_channel; ++j) {
+          for (int k = 0; k < in_channel; ++k) {
+            for (int m = 0; m < filter_size; ++m) {
+              filter_data[k][j][m] = (params_[((j*in_channel) + k) * filter_size + m]);
+            }
+          }
+        }
+    
+    
+        std::vector< std::tuple<std::vector<std::array<Dtype, 25> >, std::vector<uint32_t>>> result;
+      
+      
+        for (int j = 0; j < in_channel; ++j) {
+          result.push_back(dkm::kmeans_lloyd(filter_data[j], out_channel / ZH_COMPRESSION_RATE));
+        }
+                
+          
+
+    
+        for (int j = 0; j < out_channel; ++j) {
+          for (int k = 0; k < in_channel; ++k) {
+            for (int m = 0; m < filter_size; ++m) {
+              auto delta = filter_data[k][j][m] - std::get<0>(result[k])[std::get<1>(result[k])[j]][m];
+              error += delta * delta;
+            }
+            //error += dkm::details::distance_squared(filter_data[k][j], std::get<0>(result[k])[std::get<1>(result[k])[j]]);
+          }
+        }
+      }
+      else if (filter_size == 9) {
+        std::vector<std::vector<std::array<Dtype, 9>> > filter_data(in_channel);
+        for (int j = 0; j < in_channel; ++j) {
+          filter_data[j] = std::vector<std::array<Dtype, 9> >(out_channel); //= new Dtype*[out_channel];
+
+        }
+    
+        for (int j = 0; j < out_channel; ++j) {
+          for (int k = 0; k < in_channel; ++k) {
+            for (int m = 0; m < filter_size; ++m) {
+              filter_data[k][j][m] = (params_[((j*in_channel) + k) * filter_size + m]);
+            }
+          }
+        }
+    
+    
+        std::vector< std::tuple<std::vector<std::array<Dtype, 9> >, std::vector<uint32_t>>> result;
+      
+      
+        for (int j = 0; j < in_channel; ++j) {
+          result.push_back(dkm::kmeans_lloyd(filter_data[j], out_channel / ZH_COMPRESSION_RATE));
+        }
+                
+          
+
+    
+        for (int j = 0; j < out_channel; ++j) {
+          for (int k = 0; k < in_channel; ++k) {
+            for (int m = 0; m < filter_size; ++m) {
+              auto delta = filter_data[k][j][m] - std::get<0>(result[k])[std::get<1>(result[k])[j]][m];
+              error += delta * delta;
+            }
+            //error += dkm::details::distance_squared(filter_data[k][j], std::get<0>(result[k])[std::get<1>(result[k])[j]]);
+          }
+        }
+      } 
+      else {
+      
+      }
+    
+    
+    
+    
+    }
+    //blob[0]->cpu_data()
+  
+  }
+  
+  return error;
+}
+
+
 
 template <typename Dtype>
 void SGDSolver<Dtype>::Normalize(int param_id) {
@@ -174,6 +360,12 @@ void SGDSolver<Dtype>::Regularize(int param_id) {
   }
   case Caffe::GPU: {
 #ifndef CPU_ONLY
+
+    if(this->iter_ > CLUSTERING_ITR) {
+      zh_clustering();
+    }
+
+
     if (local_decay) {
       if (regularization_type == "L2") {
         // add weight decay
